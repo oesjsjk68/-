@@ -2,7 +2,7 @@ import asyncio
 import os
 import random
 
-from aiogram import Bot, Dispatcher, 
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-bot = Bot(token=TOKEN)
+bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
 # ================= РОЛИ (добавляй новые сюда) =================
@@ -33,7 +33,6 @@ ROLES = {
     "mayor":      {"name": "🏛 Мэр",             "desc": "Твой голос на голосовании считается за два."},
 }
 
-# чья роль: city / mafia / maniac / neutral (добавляй новые сюда же)
 ROLE_TEAM = {
     "civilian": "city", "commissar": "city", "sergeant": "city",
     "doctor": "city", "lover": "city", "lawyer": "city", "lucky": "city",
@@ -42,7 +41,6 @@ ROLE_TEAM = {
     "don": "mafia", "mafia": "mafia", "maniac": "maniac",
 }
 
-# какое ночное действие делает роль (добавляй новые сюда же)
 ROLE_ACTION = {
     "don": "kill", "mafia": "kill", "maniac": "kill",
     "doctor": "heal", "commissar": "check", "sergeant": "check",
@@ -67,7 +65,7 @@ def roles_keyboard() -> InlineKeyboardMarkup:
     keys = list(ROLES.keys())
     rows = []
     for i in range(0, len(keys), 2):
-        row = [InlineKeyboardButton(text=ROLES[k]["name"], callback_data=f"role:{k}")]
+        row = [InlineKeyboardButton(text=ROLES[keys[i]]["name"], callback_data=f"role:{keys[i]}")]
         if i + 1 < len(keys):
             row.append(InlineKeyboardButton(text=ROLES[keys[i + 1]]["name"],
                                             callback_data=f"role:{keys[i + 1]}"))
@@ -78,7 +76,7 @@ def roles_keyboard() -> InlineKeyboardMarkup:
 def player_kb(g, prefix, allow_self=True):
     rows, alive = [], []
     for idx, (uid, name) in enumerate(g["players"]):
-        if uid in g["alive"] and (allow_self or uid != g["last_actor"]):
+        if uid in g["alive"] and (allow_self or uid != g.get("last_actor")):
             alive.append((idx + 1, uid, name))
     for i in range(0, len(alive), 2):
         rows.append([InlineKeyboardButton(
@@ -131,10 +129,10 @@ def check_win(g):
     roles, alive = g["roles"], list(g["alive"])
     maf = [u for u in alive if roles[u] in ("don", "mafia")]
     maniacs = [u for u in alive if roles[u] == "maniac"]
-    city = [u for u in alive if roles[u] not in ("don", "mafia", "maniac")]
+    others = len(alive) - len(maf)
     if not maf and not maniacs:
         return "🌍 Победа города!"
-    if len(maf) >= len(alive) - len(maf):
+    if len(maf) >= others:
         return "🩸 Победа мафии!"
     if not maf and len(alive) == len(maniacs) == 1:
         return "🔪 Победа маньяка!"
@@ -148,6 +146,7 @@ async def end_game(cid, reason):
     reveal = "\n".join(f"{name_of(g, u)} — {ROLES[r]['name']}"
                        for u, r in g["roles"].items())
     await bot.send_message(cid, f"{reason}\n\n🎭 Роли игроков:\n{reveal}")
+    await bot.send_message(cid, "Новая игра: /join → /start_game")
 
 
 # ================= МЕНЮ РОЛЕЙ =================
@@ -159,6 +158,7 @@ async def cmd_start(message: Message):
         "/join — записаться на игру\n"
         "/start_game — начать (минимум 5 игроков)\n"
         "/night — начать ночь (после раздачи ролей)\n"
+        "/resolve — подвести итог ночи (когда все походили)\n"
         "/list — список игроков с номерами\n"
         "/vote номер — проголосовать днём\n"
         "/boom номер — взрыв камикадзе\n"
@@ -185,8 +185,8 @@ async def show_role(cb: CallbackQuery):
 async def cmd_join(message: Message):
     g = games.setdefault(message.chat.id, {
         "players": [], "alive": set(), "roles": {}, "started": False,
-        "phase": None, "actions": {}, "votes": {}, "shield": set(),
-        "boom_used": False,
+        "phase": None, "actions": {}, "expected": set(), "votes": {},
+        "shield": set(), "boom_used": False,
     })
     if g["started"]:
         await message.answer("Игра уже идёт.")
@@ -202,7 +202,7 @@ async def cmd_join(message: Message):
 @dp.message(Command("start_game"))
 async def cmd_start_game(message: Message):
     g = games.get(message.chat.id)
-    if not g or g["started"]:
+    if not g or g["started"] or not g["players"]:
         await message.answer("Сначала собери игроков через /join.")
         return
     if len(g["players"]) < 5:
@@ -214,6 +214,10 @@ async def cmd_start_game(message: Message):
     g["phase"] = "night1"
     g["alive"] = {uid for uid, _ in players}
     g["roles"] = {uid: r for (uid, _), r in zip(players, build_roles(len(players)))}
+    g["votes"] = {}
+    g["actions"] = {}
+    g["shield"] = set()
+    g["boom_used"] = False
 
     for uid, name in players:
         role = ROLES[g["roles"][uid]]
@@ -221,7 +225,7 @@ async def cmd_start_game(message: Message):
             await bot.send_message(
                 uid,
                 f"🎭 Твоя роль: <b>{role['name']}</b>\n\n{role['desc']}\n\n"
-                "Список игроков будет в чате (/list). Удачи!")
+                "Список игроков — в чате (/list). Удачи!")
         except Exception:
             await message.answer(
                 f"⚠️ Не смог написать {name} — пусть нажмёт /start у бота в личке.")
@@ -248,25 +252,27 @@ async def cmd_night(message: Message):
                                    reply_markup=player_kb(g, "act"))
         except Exception:
             pass
-    await message.answer("🌙 Город засыпает. Проснулись только активные роли — "
-                         "ходят в личке. Когда все походили — /resolve")
+    await message.answer(
+        "🌙 Город засыпает. Активные роли ходят в личке.\n"
+        "Ведущий: когда все походили — /resolve")
 
 
 @dp.callback_query(F.data.startswith("act:"))
 async def do_action(cb: CallbackQuery):
     target = int(cb.data.split(":")[1])
     uid = cb.from_user.id
-    for cid, g in games.items():
-        if uid in g.get("expected", set()) and g["phase"] == "night":
+    cid = None
+    g = None
+    for chat_id, game in games.items():
+        if uid in game.get("expected", set()) and game["phase"] == "night":
+            cid, g = chat_id, game
             break
-    else:
+    if g is None:
         await cb.answer("Сейчас не твой ход.")
         return
 
     role = g["roles"][uid]
-    # мафия не может убить свою
-    if ROLE_ACTION[role] == "kill" and ROLE_TEAM[g["roles"].get(target, "")] == "mafia" \
-            and role in ("don", "mafia"):
+    if ROLE_ACTION[role] == "kill" and ROLE_TEAM.get(g["roles"].get(target, "")) == "mafia":
         await cb.answer("Нельзя убить своего!")
         return
 
@@ -278,62 +284,58 @@ async def do_action(cb: CallbackQuery):
             pass
     await cb.answer("Принято ✅")
     if set(g["actions"]) >= g["expected"]:
-        await resolve_night(cid)
+        await bot.send_message(cid, "✅ Все ночные роли сделали ход. Ведущий: /resolve")
 
 
 @dp.message(Command("resolve"))
 async def cmd_resolve(message: Message):
     g = games.get(message.chat.id)
-    if g and g["phase"] == "night":
+    if g and g["phase"] in ("night", "night1"):
         await resolve_night(message.chat.id)
 
 
 async def resolve_night(cid):
     g = games[cid]
-    roles, acts = g["roles"], g["actions"]
+    roles = g["roles"]
 
-    blocked = next((t for u, t in acts.items() if roles[u] == "lover"), None)
-    healed = next((t for u, t in acts.items() if roles[u] == "doctor"), None)
-    guarded = next((t for u, t in acts.items() if roles[u] == "bodyguard"), None)
+    # любовница отменяет действие своей цели
+    lover_targets = {t for u, t in g["actions"].items() if roles.get(u) == "lover"}
+    acts = {u: t for u, t in g["actions"].items() if t not in lover_targets}
+
+    healed = next((t for u, t in acts.items() if roles.get(u) == "doctor"), None)
+    guarded = next((t for u, t in acts.items() if roles.get(u) == "bodyguard"), None)
+    kills = [t for u, t in acts.items()
+             if roles.get(u) in ("don", "mafia", "maniac")]
+
     deaths = []
+    guard_death = None
 
-    def kill(target):
-        if target is None or target not in g["alive"] or target in deaths_list(g):
-            return
+    for target in kills:
+        if target not in g["alive"]:
+            continue
         if target == healed:
-            return
+            continue
         if target == guarded:
             for u, t in acts.items():
-                if roles[u] == "bodyguard":
+                if roles.get(u) == "bodyguard":
                     g["alive"].discard(u)
-                    deaths.append(name_of(g, u) + " (телохранитель погиб за того, кого охранял)")
-            return
-        if roles[target] == "lucky" and target not in g["shield"]:
+                    guard_death = name_of(g, u)
+            continue
+        if roles.get(target) == "lucky" and target not in g["shield"]:
             g["shield"].add(target)
-            return
+            continue
         g["alive"].discard(target)
         deaths.append(name_of(g, target))
 
-    def deaths_list(g):
-        return []
-
-    for u, t in acts.items():
-        if roles[u] == "lover" and t == blocked:
-            pass
-    for u, t in acts.items():
-        r = roles[u]
-        if r in ("don", "mafia") and ROLE_ACTION.get(r) == "kill":
-            if u != blocked:  # заблокированный любовницей не действует
-                kill(t)
-    for u, t in acts.items():
-        if roles[u] == "maniac" and u != blocked:
-            kill(t)
-
+    parts = []
     if deaths:
-        text = "☀️ Утро. Этой ночью город потерял: " + ", ".join(deaths)
+        parts.append("☀️ Утро. Этой ночью город потерял: " + ", ".join(deaths))
     else:
-        text = "☀️ Утро. Этой ночью все выжили 😴"
+        parts.append("☀️ Утро. Этой ночью все выжили 😴")
+    if guard_death:
+        parts.append(f"🛡 {guard_death} погиб, защищая того, кого охранял.")
 
+    text = "\n\n".join(parts)
     result = check_win(g)
     if result:
         await end_game(cid, text + "\n\n" + result)
@@ -341,7 +343,10 @@ async def resolve_night(cid):
 
     g["phase"] = "day"
     g["votes"] = {}
-    await bot.send_message(cid, text + "\n\n/discussion! Голосуй: /vote номер игрока.\n/list — список игроков.")
+    await bot.send_message(
+        cid,
+        text + "\n\nОбсуждайте и голосуйте: /vote номер игрока.\n"
+               "/list — список игроков. Камикадзе: /boom номер.")
 
 
 # ================= ДЕНЬ =================
@@ -364,7 +369,7 @@ async def cmd_vote(message: Message):
         return
     try:
         num = int(message.text.removeprefix("/vote").strip()) - 1
-    except ValueError:
+    except (ValueError, IndexError):
         await message.answer("Формат: /vote номер (см. /list)")
         return
     if num < 0 or num >= len(g["players"]):
@@ -376,14 +381,15 @@ async def cmd_vote(message: Message):
         return
     voter = message.from_user.id
     if voter not in g["alive"]:
+        await message.answer("Мёртвые не голосуют 🙂")
         return
     weight = 2 if g["roles"][voter] == "mayor" else 1
     g["votes"][voter] = (target, weight)
-    await message.answer(f"Голос против {name_of(g, target)} принят "
-                         f"(вес {weight}). Голосов: {sum(w for _, w in g['votes'].values())}")
-
-    needed = len(g["alive"]) // 2 + 1
-    if sum(w for _, w in g["votes"].values()) >= needed:
+    total = sum(w for _, w in g["votes"].values())
+    await message.answer(
+        f"Голос против {name_of(g, target)} принят (вес {weight}). "
+        f"Голосов: {total} из {len(g['alive']) // 2 + 1} необходимых.")
+    if total >= len(g["alive"]) // 2 + 1:
         await resolve_lynch(message.chat.id)
 
 
@@ -397,16 +403,16 @@ async def resolve_lynch(cid):
     top = max(counts.values())
     candidates = [u for u, c in counts.items() if c == top]
     if len(candidates) > 1:
-        await bot.send_message(cid, "🤝 Голоса разделились — никто не казнён. /night")
+        await bot.send_message(cid, "🤝 Голоса разделились — никто не казнён. Ведущий: /night")
         return
 
     target = candidates[0]
-    lawyer = next((t for u, t in g["actions"].items() if g["roles"][u] == "lawyer"), None)
+    lawyer = next((t for u, t in g["actions"].items() if g["roles"].get(u) == "lawyer"), None)
     if target == lawyer:
-        await bot.send_message(cid, f"⚖️ Адвокат спас {name_of(g, target)}! Город расходится. /night")
+        await bot.send_message(cid, f"⚖️ Адвокат спас {name_of(g, target)}! Город расходится. Ведущий: /night")
         return
 
-    if g["roles"][target] == "suicide":
+    if g["roles"].get(target) == "suicide":
         g["alive"].discard(target)
         await end_game(cid, f"💪 {name_of(g, target)} изгнан... и оказался Самоубийцей. "
                             "🤦 Самоубийца побеждает!")
@@ -444,7 +450,8 @@ async def cmd_boom(message: Message):
                                         f"и себя!\n\n{result}")
     else:
         await bot.send_message(message.chat.id,
-                               f"💣 БУМ! Погибли {name_of(g, uid)} и {name_of(g, target)}. /night")
+                               f"💣 БУМ! Погибли {name_of(g, uid)} и {name_of(g, target)}. "
+                               "Ведущий: /night")
 
 
 @dp.message(Command("end"))
@@ -456,6 +463,9 @@ async def cmd_end(message: Message):
 
 # ================= ЗАПУСК =================
 async def main():
+    if not TOKEN:
+        print("ОШИБКА: BOT_TOKEN не задан! Добавь переменную окружения BOT_TOKEN.")
+        return
     print("Бот запущен...")
     await dp.start_polling(bot)
 
